@@ -28,22 +28,26 @@ st.set_page_config(page_title="4H Sequence Model — Backtester", layout="wide")
 st.markdown(
     """
     <style>
+      .stApp {background-color: #eef1f6;}
       .block-container {padding-top: 1.6rem; max-width: 1500px;}
       .mcard{display:flex;justify-content:space-between;align-items:center;
-             background:#ffffff;border:1px solid #eceef3;border-radius:16px;
-             padding:18px 20px;box-shadow:0 1px 2px rgba(16,24,40,.04);
+             background:#ffffff;border:1px solid #e6e9f0;border-radius:16px;
+             padding:18px 20px;box-shadow:0 4px 14px rgba(16,24,40,.08);
              min-height:84px;margin-bottom:4px;}
       .mcard-label{color:#667085;font-size:13px;font-weight:500;margin-bottom:7px;}
       .mcard-value{font-size:26px;font-weight:700;line-height:1;}
       .mcard-icon{width:44px;height:44px;border-radius:11px;display:flex;
                   align-items:center;justify-content:center;font-size:20px;}
-      .panel{background:#ffffff;border:1px solid #eceef3;border-radius:16px;
-             padding:22px 24px;box-shadow:0 1px 2px rgba(16,24,40,.04);}
+      .panel{background:#ffffff;border:1px solid #e6e9f0;border-radius:16px;
+             padding:22px 24px;box-shadow:0 4px 14px rgba(16,24,40,.08);}
       .panel-title{font-size:20px;font-weight:700;color:#101828;margin-bottom:18px;}
       .bk{text-align:center;}
       .bk-label{color:#667085;font-size:14px;margin-bottom:6px;}
       .bk-value{font-size:30px;font-weight:700;}
       .sec-title{font-size:22px;font-weight:700;color:#101828;margin:6px 0 12px 0;}
+      div[data-testid="stVerticalBlockBorderWrapper"]{
+             background:#ffffff;border-radius:16px;
+             box-shadow:0 4px 14px rgba(16,24,40,.08);}
     </style>
     """,
     unsafe_allow_html=True,
@@ -146,6 +150,9 @@ def sample_data(n: int = 1500, seed: int = 7) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 SCALE_TIERS = [(0.00, 0.25, 0.25), (0.25, 0.35, 0.35), (0.35, 0.45, 0.45)]
 
+RR_TARGET = 3.0        # take-profit distance in R
+BE_TRIGGER = 1.0       # once price reaches this many R, stop is moved to entry
+
 
 def scale_mult(close_pct: float, out_of_spec: str):
     """Return the scale-matrix multiplier for a given Close_Pct.
@@ -183,7 +190,7 @@ def detect_setup(df: pd.DataFrame, i: int, out_of_spec: str):
         entry = c4["low"] + rng * mult
         sl = c4["low"]
         risk = entry - sl
-        tp = entry + risk * 2.0
+        tp = entry + risk * RR_TARGET
         return dict(direction="LONG", c4_idx=i + 3, c5_idx=i + 4,
                     entry=entry, sl=sl, tp=tp, risk=risk, close_pct=close_pct)
 
@@ -201,28 +208,69 @@ def detect_setup(df: pd.DataFrame, i: int, out_of_spec: str):
         entry = c4["high"] - rng * mult
         sl = c4["high"]
         risk = sl - entry
-        tp = entry - risk * 2.0
+        tp = entry - risk * RR_TARGET
         return dict(direction="SHORT", c4_idx=i + 3, c5_idx=i + 4,
                     entry=entry, sl=sl, tp=tp, risk=risk, close_pct=close_pct)
 
     return None
 
 
-def resolve_bar(bar, s, ambiguous):
-    """Return 'WIN' / 'LOSS' / 'BE' / None for a single bar against setup s."""
-    if s["direction"] == "LONG":
-        hit_sl = bar["low"] <= s["sl"]
-        hit_tp = bar["high"] >= s["tp"]
-    else:
-        hit_sl = bar["high"] >= s["sl"]
-        hit_tp = bar["low"] <= s["tp"]
-    if hit_sl and hit_tp:
-        return {"be": "BE", "loss": "LOSS", "win": "WIN"}[ambiguous]
-    if hit_sl:
-        return "LOSS"
-    if hit_tp:
-        return "WIN"
-    return None
+def simulate_exit(df, s, c5, n, ambiguous):
+    """Walk bars from C5 onward applying the move-to-breakeven rule.
+
+    Logic:
+      * SL starts at the C4 extreme (1R risk).
+      * Once price trades +1R in favour, the stop is moved to entry (BE).
+      * After that, touching entry = break-even (0R); touching TP = win (+3R).
+      * If the original SL is hit before +1R is reached = loss (-1R).
+    Returns (outcome, exit_index).
+    """
+    entry, sl0, tp, risk = s["entry"], s["sl"], s["tp"], s["risk"]
+    long = s["direction"] == "LONG"
+    r1 = entry + risk * BE_TRIGGER if long else entry - risk * BE_TRIGGER
+    be_active = False
+
+    for j in range(c5, n):
+        bar = df.iloc[j]
+        hi, lo = bar["high"], bar["low"]
+        if long:
+            hit_tp = hi >= tp
+            reached_1r = hi >= r1
+            hit_sl0 = lo <= sl0
+            hit_entry = lo <= entry
+        else:
+            hit_tp = lo <= tp
+            reached_1r = lo <= r1
+            hit_sl0 = hi >= sl0
+            hit_entry = hi >= entry
+
+        if not be_active:
+            if hit_sl0 and reached_1r:
+                # spiked to +1R and back to the original stop in one bar
+                if ambiguous == "loss":
+                    return "LOSS", j
+                be_active = True
+                if hit_tp:
+                    return "WIN", j
+                return "BE", j           # stop now at entry, and entry was touched
+            if hit_sl0:
+                return "LOSS", j
+            if reached_1r:
+                be_active = True
+                if hit_tp:
+                    return "WIN", j
+                if hit_entry:
+                    return "BE", j
+                # else: stop is at entry, carry to next bar
+        else:
+            if hit_tp and hit_entry:
+                return ("WIN" if ambiguous == "win" else "BE"), j
+            if hit_tp:
+                return "WIN", j
+            if hit_entry:
+                return "BE", j
+
+    return None, None
 
 
 def backtest(df, account, risk_pct, ambiguous="be", out_of_spec="extend"):
@@ -250,19 +298,14 @@ def backtest(df, account, risk_pct, ambiguous="be", out_of_spec="extend"):
             i += 1  # order canceled at C5 close; keep scanning
             continue
 
-        # ---- Track exit from C5 onward ----
-        outcome, exit_idx = None, None
-        for j in range(c5, n):
-            res = resolve_bar(df.iloc[j], s, ambiguous)
-            if res:
-                outcome, exit_idx = res, j
-                break
+        # ---- Track exit from C5 onward (with move-to-BE at +1R) ----
+        outcome, exit_idx = simulate_exit(df, s, c5, n, ambiguous)
 
         if outcome is None:           # never resolved before data ended
             i += 1
             continue
 
-        r_mult = {"WIN": 2.0, "LOSS": -1.0, "BE": 0.0}[outcome]
+        r_mult = {"WIN": RR_TARGET, "LOSS": -1.0, "BE": 0.0}[outcome]
         risk_amt = balance * risk_pct / 100.0
         pnl = r_mult * risk_amt
         balance += pnl
@@ -337,10 +380,10 @@ def equity_chart(trades, account):
                                line=dict(color=BLUE, width=2)))
     fig.update_layout(
         height=340, margin=dict(l=10, r=10, t=10, b=10),
-        plot_bgcolor="white", paper_bgcolor="white",
+        plot_bgcolor="white", paper_bgcolor="white", dragmode=False,
         xaxis_title="Trade #", yaxis_title="Capital",
-        yaxis=dict(tickprefix="$", gridcolor="#f0f1f4"),
-        xaxis=dict(gridcolor="#f7f8fa"),
+        yaxis=dict(tickprefix="$", gridcolor="#f0f1f4", fixedrange=True),
+        xaxis=dict(gridcolor="#f7f8fa", fixedrange=True),
     )
     return fig
 
@@ -355,10 +398,10 @@ def drawdown_chart(trades, account):
                                fillcolor="rgba(220,38,38,.18)"))
     fig.update_layout(
         height=340, margin=dict(l=10, r=10, t=10, b=10),
-        plot_bgcolor="white", paper_bgcolor="white",
+        plot_bgcolor="white", paper_bgcolor="white", dragmode=False,
         xaxis_title="Trade #", yaxis_title="Drawdown %",
-        yaxis=dict(ticksuffix="%", gridcolor="#f0f1f4"),
-        xaxis=dict(gridcolor="#f7f8fa"),
+        yaxis=dict(ticksuffix="%", gridcolor="#f0f1f4", fixedrange=True),
+        xaxis=dict(gridcolor="#f7f8fa", fixedrange=True),
     )
     return fig
 
@@ -383,12 +426,14 @@ risk_pct = st.sidebar.number_input("Risk per trade (%)", min_value=0.01,
 
 with st.sidebar.expander("Advanced (spec edge cases)"):
     ambiguous = st.selectbox(
-        "If a bar hits both TP and SL",
+        "If one bar hits two levels at once",
         options=["be", "loss", "win"],
-        format_func=lambda v: {"be": "Break-even (scratch)",
-                               "loss": "Conservative (loss)",
-                               "win": "Optimistic (win)"}[v],
-        help="OHLC bars don't reveal intrabar order. The spec is silent on this.",
+        format_func=lambda v: {"be": "Break-even / conservative",
+                               "loss": "Treat as loss",
+                               "win": "Treat as win"}[v],
+        help="OHLC bars don't reveal the order ticks were hit. Used when a "
+             "single bar touches both the stop and a profit level. "
+             "Strategy: +3R target, stop moved to break-even at +1R.",
     )
     out_of_spec = st.selectbox(
         "If Close_Pct > 0.45 (undefined in spec)",
@@ -482,12 +527,14 @@ with ch[0]:
     with st.container(border=True):
         st.markdown('<div class="panel-title">Equity Curve</div>',
                     unsafe_allow_html=True)
-        st.plotly_chart(equity_chart(trades, account), use_container_width=True)
+        st.plotly_chart(equity_chart(trades, account), use_container_width=True,
+                        config={"displayModeBar": False, "scrollZoom": False})
 with ch[1]:
     with st.container(border=True):
         st.markdown('<div class="panel-title">Drawdown Chart</div>',
                     unsafe_allow_html=True)
-        st.plotly_chart(drawdown_chart(trades, account), use_container_width=True)
+        st.plotly_chart(drawdown_chart(trades, account), use_container_width=True,
+                        config={"displayModeBar": False, "scrollZoom": False})
 
 # --------------------------------------------------------------------------- #
 # Trade Journal
@@ -568,7 +615,7 @@ components.html(
 )
 
 st.caption(
-    "Educational backtesting tool implementing the supplied specification. "
+    "Educational backtesting tool implementing the supplied specification "
+    "(+3R target, stop moved to break-even at +1R). "
     "Not financial advice; past simulated results do not predict future returns."
 )
-
