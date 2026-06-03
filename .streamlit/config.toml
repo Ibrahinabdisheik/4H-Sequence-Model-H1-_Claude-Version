@@ -1,4 +1,6 @@
-streamlit>=1.31
-pandas>=2.0
-numpy>=1.24
-plotly>=5.18
+[theme]
+base = "light"
+backgroundColor = "#eef1f6"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#101828"
+primaryColor = "#2563eb"
