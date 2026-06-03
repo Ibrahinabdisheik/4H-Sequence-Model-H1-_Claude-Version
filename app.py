@@ -47,11 +47,26 @@ st.markdown(
       li[role="option"], li[role="option"] *{color:#101828 !important;}
       input, textarea{color:#101828 !important;}
 
-      .stDownloadButton button, .stButton button{
+      /* sidebar input widgets -> clean light look */
+      section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"]{
+            background:#f8fafc !important;border:1.5px dashed #cbd5e1 !important;}
+      section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] *{color:#475467 !important;}
+      section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button{
+            background:#ffffff !important;color:#1d4ed8 !important;border:1px solid #cbd5e1 !important;
+            box-shadow:none !important;font-weight:600 !important;}
+      section[data-testid="stSidebar"] [data-testid="stFileUploaderFile"] *{color:#101828 !important;}
+      section[data-testid="stSidebar"] input{background:#ffffff !important;color:#101828 !important;}
+      section[data-testid="stSidebar"] [data-baseweb="input"]{
+            background:#ffffff !important;border:1px solid #d9dee8 !important;border-radius:8px !important;}
+      section[data-testid="stSidebar"] [data-testid="stNumberInput"] button{
+            background:#f1f5f9 !important;color:#101828 !important;border:1px solid #e2e8f0 !important;
+            box-shadow:none !important;}
+
+      .stDownloadButton button{
         background:#2563eb !important;color:#fff !important;border:none !important;
         border-radius:10px !important;padding:.55rem 1.1rem !important;font-weight:600 !important;
         box-shadow:0 2px 8px rgba(37,99,235,.28) !important;}
-      .stDownloadButton button:hover, .stButton button:hover{background:#1d4ed8 !important;}
+      .stDownloadButton button:hover{background:#1d4ed8 !important;}
       .stDownloadButton button *{color:#fff !important;}
 
       .mcard{display:flex;justify-content:space-between;align-items:flex-start;
@@ -196,45 +211,40 @@ def sample_data(n: int = 1500, seed: int = 7) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Strategy / backtest engine
 # --------------------------------------------------------------------------- #
-RR_TARGET = 1.5        # take-profit distance in R
-
-
 def detect_setup(df, i):
     """Check C1..C4 at rows i..i+3 for a valid structure + EBP close.
-    Returns (direction, sl) or None. Entry is taken later at the C5 open."""
+    Returns (direction, c4_low, c4_high) or None."""
     c1, c2, c3, c4 = df.iloc[i], df.iloc[i + 1], df.iloc[i + 2], df.iloc[i + 3]
 
-    # Bullish
     if (c2["high"] > c1["high"] and c3["low"] > c1["high"]
             and c4["low"] < c3["low"] and c4["close"] > c3["open"]):
-        return "LONG", c4["low"]
+        return "LONG", c4["low"], c4["high"]
 
-    # Bearish
     if (c2["low"] < c1["low"] and c3["high"] < c1["low"]
             and c4["high"] > c3["high"] and c4["close"] < c3["open"]):
-        return "SHORT", c4["high"]
+        return "SHORT", c4["low"], c4["high"]
 
     return None
 
 
-def simulate_exit(df, direction, entry, sl, tp, start_idx, n, ambiguous):
-    """First-touch exit from start_idx (the C5 bar) onward."""
+def simulate_exit(df, direction, entry, sl, tp, start_idx, n):
+    """First-touch exit from start_idx onward. Same-bar TP+SL -> conservative loss."""
     for j in range(start_idx, n):
         bar = df.iloc[j]
         if direction == "LONG":
             hit_sl, hit_tp = bar["low"] <= sl, bar["high"] >= tp
         else:
             hit_sl, hit_tp = bar["high"] >= sl, bar["low"] <= tp
-        if hit_sl and hit_tp:
-            return {"be": "BE", "loss": "LOSS", "win": "WIN"}[ambiguous], j
-        if hit_sl:
+        if hit_sl:          # conservative: stop checked first on ambiguous bars
             return "LOSS", j
         if hit_tp:
             return "WIN", j
     return None, None
 
 
-def backtest(df, account, risk_pct, ambiguous="loss"):
+def backtest(df, account, risk_pct, entry_level, rr):
+    """Limit entry placed at `entry_level` of the C4 range (from the C4 extreme),
+    valid during C5 only; stop at the C4 extreme; target at `rr` x risk."""
     n = len(df)
     balance = float(account)
     trades = []
@@ -245,37 +255,45 @@ def backtest(df, account, risk_pct, ambiguous="loss"):
             i += 1
             continue
 
-        direction, sl = found
+        direction, c4l, c4h = found
+        rng = c4h - c4l
+        if rng <= 0:
+            i += 1
+            continue
+
         c4_idx, c5 = i + 3, i + 4
-        entry = df.iloc[c5]["open"]            # market entry once C4 closes
+        bar5 = df.iloc[c5]
 
-        # validate risk direction (skip if the open is already through the stop)
         if direction == "LONG":
-            if entry <= sl:
-                i += 1
-                continue
+            entry = c4l + rng * entry_level
+            sl = c4l
             risk = entry - sl
-            tp = entry + risk * RR_TARGET
-        else:
-            if entry >= sl:
+            if risk <= 0 or bar5["low"] > entry:      # limit not filled during C5
                 i += 1
                 continue
+            tp = entry + rr * risk
+        else:
+            entry = c4h - rng * entry_level
+            sl = c4h
             risk = sl - entry
-            tp = entry - risk * RR_TARGET
+            if risk <= 0 or bar5["high"] < entry:
+                i += 1
+                continue
+            tp = entry - rr * risk
 
-        outcome, exit_idx = simulate_exit(df, direction, entry, sl, tp, c5, n, ambiguous)
+        outcome, exit_idx = simulate_exit(df, direction, entry, sl, tp, c5, n)
         if outcome is None:
             i += 1
             continue
 
-        r_mult = {"WIN": RR_TARGET, "LOSS": -1.0, "BE": 0.0}[outcome]
+        r_mult = rr if outcome == "WIN" else -1.0
         risk_amt = balance * risk_pct / 100.0
         pnl = r_mult * risk_amt
         balance += pnl
 
         trades.append(dict(
             num=len(trades) + 1, direction=direction,
-            setup_time=df.iloc[c4_idx]["datetime"], entry_time=df.iloc[c5]["datetime"],
+            setup_time=df.iloc[c4_idx]["datetime"], entry_time=bar5["datetime"],
             exit_time=df.iloc[exit_idx]["datetime"],
             entry=entry, sl=sl, tp=tp, outcome=outcome, r=r_mult,
             pnl=pnl, balance=balance, exit_idx=exit_idx,
@@ -402,14 +420,15 @@ st.sidebar.subheader("Account")
 account = st.sidebar.number_input("Account size ($)", min_value=1.0, value=100_000.0, step=1000.0)
 risk_pct = st.sidebar.number_input("Risk per trade (%)", min_value=0.01, value=1.0, step=0.25)
 
-with st.sidebar.expander("Advanced"):
-    ambiguous = st.selectbox(
-        "If one bar hits both TP and SL",
-        options=["loss", "be", "win"],
-        format_func=lambda v: {"loss": "Conservative (loss)",
-                               "be": "Break-even (scratch)",
-                               "win": "Optimistic (win)"}[v],
-        help="OHLC bars don't reveal which level was touched first within a bar.")
+st.sidebar.subheader("Model")
+entry_level = st.sidebar.number_input(
+    "Entry level (fraction of C4 range)", min_value=0.05, max_value=0.95,
+    value=0.25, step=0.025, format="%.3f",
+    help="Where the limit sits inside the C4 candle, measured from the C4 extreme. "
+         "0.25 = 25%. Optimal on XAUUSD 60m ≈ 0.25 (your 0.375 was net-negative).")
+rr = st.sidebar.number_input(
+    "Target (RR)", min_value=0.5, max_value=6.0, value=3.0, step=0.25,
+    help="Take-profit distance in multiples of risk.")
 
 # --------------------------------------------------------------------------- #
 # Load + run
@@ -426,7 +445,7 @@ else:
     df = sample_data()
     st.info("No file uploaded - showing sample synthetic data. Upload a 60m OHLC CSV to backtest your own.")
 
-trades, final_balance = backtest(df, account, risk_pct, ambiguous)
+trades, final_balance = backtest(df, account, risk_pct, entry_level, rr)
 if trades.empty:
     st.warning("No trades were generated for this dataset / settings.")
     st.stop()
@@ -548,6 +567,6 @@ with st.container(border=True):
         </div>
         """, height=540)
 
-st.caption("Educational backtester. Entry: market at C5 open after C4 (EBP) close · stop at C4 extreme · "
-           "target 1.5R · no break-even rule. Not financial advice; simulated results do not predict future returns.")
-
+st.caption("Educational backtester. Limit entry at the chosen fraction of the C4 range (valid during C5), "
+           "stop at the C4 extreme, fixed RR target, conservative tie-breaks, no break-even rule. "
+           "Not financial advice; simulated results do not predict future returns.")
