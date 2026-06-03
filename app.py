@@ -85,21 +85,28 @@ def load_ohlc(file_or_buffer) -> pd.DataFrame:
     date_only = pick("date")
     time_only = pick("time")
 
+    # Parse with utc=True so rows carrying different timezone offsets
+    # (common in broker/TradingView exports, esp. around DST changes) all
+    # normalize to a single timezone instead of raising "Mixed timezones".
     if date_only and time_only and date_only != time_only:
         dt = pd.to_datetime(
             raw[date_only].astype(str) + " " + raw[time_only].astype(str),
-            errors="coerce",
+            errors="coerce", utc=True,
         )
     elif dt_col is not None:
         series = raw[dt_col]
         if pd.api.types.is_numeric_dtype(series):
             # unix epoch (seconds or ms)
             unit = "ms" if series.max() > 1e12 else "s"
-            dt = pd.to_datetime(series, unit=unit, errors="coerce")
+            dt = pd.to_datetime(series, unit=unit, errors="coerce", utc=True)
         else:
-            dt = pd.to_datetime(series, errors="coerce")
+            dt = pd.to_datetime(series, errors="coerce", utc=True)
     else:
         raise ValueError("Could not find a date/time column.")
+
+    # Drop the timezone so every bar shares one clock (UTC wall time).
+    if getattr(dt.dt, "tz", None) is not None:
+        dt = dt.dt.tz_localize(None)
 
     df = pd.DataFrame(
         {
@@ -147,7 +154,7 @@ def scale_mult(close_pct: float, out_of_spec: str):
       'skip'    -> nullify the setup (return None)
     """
     for lo, hi, mult in SCALE_TIERS:
-        if (lo <= close_pct <= hi) if lo == 0.0 else (lo < close_pct <= hi):
+        if lo <= close_pct <= hi if lo == 0.0 else lo < close_pct <= hi:
             return mult
     # close_pct > 0.45
     if out_of_spec == "extend":
@@ -363,8 +370,9 @@ st.sidebar.header("Inputs")
 
 uploaded = st.sidebar.file_uploader("Upload 60m OHLC CSV", type=["csv"])
 symbol = st.sidebar.text_input(
-    "Symbol (for TradingView)", value="OANDA:EURUSD",
-    help="Exchange:Ticker, e.g. BINANCE:BTCUSDT, NASDAQ:AAPL, OANDA:EURUSD",
+    "Symbol (for TradingView)", value="XAUUSD",
+    help="Just the ticker — e.g. XAUUSD, EURUSD, GBPJPY, NQ1!, ES1!, BTCUSD. "
+         "No exchange/broker prefix needed; it's only used for the chart link.",
 )
 
 st.sidebar.subheader("Account")
@@ -563,3 +571,4 @@ st.caption(
     "Educational backtesting tool implementing the supplied specification. "
     "Not financial advice; past simulated results do not predict future returns."
 )
+
