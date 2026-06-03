@@ -147,7 +147,7 @@ def scale_mult(close_pct: float, out_of_spec: str):
       'skip'    -> nullify the setup (return None)
     """
     for lo, hi, mult in SCALE_TIERS:
-        if lo <= close_pct <= hi if lo == 0.0 else lo < close_pct <= hi:
+        if (lo <= close_pct <= hi) if lo == 0.0 else (lo < close_pct <= hi):
             return mult
     # close_pct > 0.45
     if out_of_spec == "extend":
